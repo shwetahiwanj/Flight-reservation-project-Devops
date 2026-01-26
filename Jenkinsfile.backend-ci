@@ -1,0 +1,100 @@
+pipeline {
+    agent any
+
+    environment {
+        DOCKER_IMAGE = "deshpandeyashrajesh/flightreservation"
+        IMAGE_TAG    = "${BUILD_NUMBER}"
+        GIT_BRANCH   = "main"
+        APP_DIR      = "FlightReservationApplication"
+        DEPLOY_FILE  = "FlightReservationApplication/k8s/backend/deployment.yml"
+    }
+
+    stages {
+
+        stage('Checkout Code') {
+            steps {
+                git branch: "${GIT_BRANCH}",
+                    url: "https://github.com/yash-deshpande24/Flight-reservation-project-Devops.git"
+            }
+        }
+
+        stage('Build & Unit Test') {
+            steps {
+                sh """
+                  cd ${APP_DIR}
+                  mvn clean verify
+                """
+            }
+        }
+
+        stage('SonarQube Analysis') {
+            steps {
+                withSonarQubeEnv('sonar') {
+                    sh """
+                      cd ${APP_DIR}
+                      mvn clean verify \
+                      org.sonarsource.scanner.maven:sonar-maven-plugin:sonar \
+                      -Dsonar.projectKey=flight-reservation-system \
+                      -Dsonar.projectName=flight-reservation-system
+                    """
+                }
+            }
+        }
+
+        stage('Quality Gate') {
+            steps {
+                timeout(time: 5, unit: 'MINUTES') {
+                    waitForQualityGate abortPipeline: true
+                }
+            }
+        }
+
+        stage('Docker Build & Push') {
+            steps {
+                withCredentials([usernamePassword(
+                    credentialsId: 'docker-credentials',
+                    usernameVariable: 'DOCKER_USER',
+                    passwordVariable: 'DOCKER_PASS'
+                )]) {
+                    sh """
+                      cd ${APP_DIR}
+                      docker login -u ${DOCKER_USER} -p ${DOCKER_PASS}
+                      docker build -t ${DOCKER_IMAGE}:${IMAGE_TAG} .
+                      docker push ${DOCKER_IMAGE}:${IMAGE_TAG}
+                    """
+                }
+            }
+        }
+
+        stage('Update K8s Manifest (GitOps)') {
+            steps {
+                withCredentials([usernamePassword(
+                    credentialsId: 'github-credentials',
+                    usernameVariable: 'GIT_USER',
+                    passwordVariable: 'GIT_TOKEN'
+                )]) {
+                    sh """
+                      sed -i 's|image:.*|image: ${DOCKER_IMAGE}:${IMAGE_TAG}|' ${DEPLOY_FILE}
+
+                      git config user.email "jenkins@ci.local"
+                      git config user.name "jenkins-ci"
+
+                      git add ${DEPLOY_FILE}
+                      git commit -m "Update backend image to ${DOCKER_IMAGE}:${IMAGE_TAG}"
+
+                      git push https://${GIT_USER}:${GIT_TOKEN}@github.com/yash-deshpande24/Flight-reservation.git ${GIT_BRANCH}
+                    """
+                }
+            }
+        }
+    }
+
+    post {
+        success {
+            echo " CI completed successfully. Argo CD will deploy automatically."
+        }
+        failure {
+            echo " CI failed."
+        }
+    }
+}
